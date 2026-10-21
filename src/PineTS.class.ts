@@ -17,6 +17,34 @@ function getTimeframeDurationMs(timeframe: string | undefined): number {
     return tf ? timeframeSeconds(tf) * 1000 : 86_400_000; // default to 1D when timeframe is unknown
 }
 
+/** Longest stretch of bar execution before the event loop gets a turn. */
+const YIELD_EVERY_MS = 30;
+
+const clock = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+/** A macrotask turn: setImmediate in Node, a MessageChannel hop in browsers and workers
+ *  (unlike setTimeout(0), not clamped to 4 ms). */
+function yieldToEventLoop(): Promise<void> {
+    if (typeof setImmediate === 'function') return new Promise((resolve) => setImmediate(resolve));
+    if (typeof MessageChannel === 'function') {
+        return new Promise((resolve) => {
+            const channel = new MessageChannel();
+            channel.port1.onmessage = () => {
+                channel.port1.close();
+                resolve();
+            };
+            channel.port2.postMessage(null);
+        });
+    }
+    return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function abortError(): Error {
+    const error = new Error('PineTS run cancelled');
+    error.name = 'AbortError';
+    return error;
+}
+
 /**
  * This class is a wrapper for the Pine Script language, it allows to run Pine Script code in a JavaScript environment
  */
@@ -68,6 +96,21 @@ export class PineTS {
     private _isSecondaryContext: boolean = false;
     public markAsSecondary() {
         this._isSecondaryContext = true;
+    }
+
+    // Cooperative cancellation. The bar loop gives the event loop a turn every
+    // YIELD_EVERY_MS, so a host (a worker running several sessions) can stop a run that
+    // was superseded — e.g. by a timeframe switch — instead of waiting for it to finish.
+    private _cancelled = false;
+    private _sliceStart = 0;
+
+    /**
+     * Stop this instance's run: it rejects with an `AbortError` within a few bars. Final for
+     * the instance — a later run rejects the same way; create a new PineTS to run again.
+     * `stream().stop()` calls it.
+     */
+    public cancel() {
+        this._cancelled = true;
     }
 
     private _syminfo: ISymbolInfo;
@@ -377,6 +420,7 @@ export class PineTS {
 
         const stop = () => {
             stopped = true;
+            this.cancel();
         };
 
         // Start execution
@@ -443,7 +487,8 @@ export class PineTS {
                     }
                 }
             } catch (error) {
-                emit('error', error);
+                // A stopped stream's run ends with the AbortError of its cancellation.
+                if (!stopped) emit('error', error);
             }
         })();
 
@@ -1249,6 +1294,15 @@ export class PineTS {
         d.close.data[last] = bar.close;
     }
 
+    /** Every few bars: stop a cancelled run, and let the event loop run once per time slice. */
+    private async _checkpoint(): Promise<void> {
+        if (this._cancelled) throw abortError();
+        if (clock() - this._sliceStart < YIELD_EVERY_MS) return;
+        await yieldToEventLoop();
+        this._sliceStart = clock();
+        if (this._cancelled) throw abortError();
+    }
+
     /**
      * Execute iterations from startIdx to endIdx, updating the context
      * @private
@@ -1257,6 +1311,7 @@ export class PineTS {
         const contextVarNames = ['const', 'var', 'let', 'params'];
 
         for (let i = startIdx; i < endIdx; i++) {
+            if ((i & 7) === 0) await this._checkpoint();
             context.idx = i;
             context._execTick = (context._execTick || 0) + 1;
 

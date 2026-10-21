@@ -17,6 +17,7 @@ This guide explains how to initialize PineTS and run indicators or strategies wi
 -   [The run() Method](#the-run-method)
 -   [The stream() Method](#the-stream-method)
 -   [The update() Method](#the-update-method)
+-   [Cancelling a Run](#cancelling-a-run)
 -   [Host Environment (Visible Range)](#host-environment-visible-range)
 -   [Non-Standard Chart Types (Heikin Ashi)](#non-standard-chart-types-heikin-ashi)
 -   [Context Object](#context-object)
@@ -375,6 +376,8 @@ evt.on('error', (error) => {
 | `'warning'` | `{ message, method?, bar }` | Non-blocking runtime warning |
 | `'error'` | `Error` | Fatal error (script halted) |
 
+`evt.stop()` also cancels the run in progress (see [Cancelling a Run](#cancelling-a-run)); a stopped stream emits no further events, not even the cancellation error.
+
 ---
 
 ## The update() Method
@@ -420,6 +423,28 @@ await pine.update();   // re-runs ONLY if the script uses visible-range
 // User pans again, but to the same range
 await pine.update();   // returns cached result, no compute
 ```
+
+---
+
+## Cancelling a Run
+
+A run gives the event loop a turn at least every 30 ms, so timers, worker messages and UI events are handled while it runs. A host can stop a run it no longer needs — for example after the user switched timeframe — with `cancel()`:
+
+```typescript
+const pineTS = new PineTS(Provider.Binance, 'BTCUSDT', '1h', 5000);
+const running = pineTS.run(indicator);
+
+// Later, from a timer, a message handler, ...
+pineTS.cancel();
+
+try {
+    await running;
+} catch (error) {
+    if (error.name !== 'AbortError') throw error;
+}
+```
+
+The run rejects with an `AbortError` within a few bars. Cancelling is final for the instance: a later `run()` on it rejects the same way, so create a new `PineTS` for the next run.
 
 ---
 
