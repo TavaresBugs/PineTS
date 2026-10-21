@@ -26,6 +26,31 @@ interface DateParts {
     dayOfWeek: number; // JS convention: 0=Sun, 1=Mon, ..., 6=Sat
 }
 
+// Building an Intl.DateTimeFormat costs far more than formatting with one, and a script
+// asks for the same bar's parts many times (every session-time call): keep one formatter
+// per timezone and the last timestamp's parts. A bad timezone throws in the constructor,
+// so it is never cached and still falls back to UTC below.
+const formatterByTz = new Map<string, Intl.DateTimeFormat>();
+const lastPartsByTz = new Map<string, { timestamp: number; parts: DateParts }>();
+function tzFormatter(timezone: string): Intl.DateTimeFormat {
+    let formatter = formatterByTz.get(timezone);
+    if (!formatter) {
+        formatter = new Intl.DateTimeFormat('en-US', {
+            timeZone: timezone,
+            year: 'numeric',
+            month: 'numeric',
+            day: 'numeric',
+            hour: 'numeric',
+            minute: 'numeric',
+            second: 'numeric',
+            weekday: 'short',
+            hour12: false,
+        });
+        formatterByTz.set(timezone, formatter);
+    }
+    return formatter;
+}
+
 /**
  * Decompose a UTC-millisecond timestamp into calendar parts
  * interpreted in the given timezone.
@@ -68,17 +93,9 @@ export function getDatePartsInTimezone(timestamp: number, timezone: string): Dat
 
     // IANA timezone name — use Intl.DateTimeFormat
     try {
-        const formatter = new Intl.DateTimeFormat('en-US', {
-            timeZone: timezone,
-            year: 'numeric',
-            month: 'numeric',
-            day: 'numeric',
-            hour: 'numeric',
-            minute: 'numeric',
-            second: 'numeric',
-            weekday: 'short',
-            hour12: false,
-        });
+        const formatter = tzFormatter(timezone);
+        const memo = lastPartsByTz.get(timezone);
+        if (memo && memo.timestamp === timestamp) return { ...memo.parts };
         const parts = formatter.formatToParts(new Date(timestamp));
         const get = (type: string) => parseInt(parts.find((p) => p.type === type)?.value || '0', 10);
 
@@ -88,7 +105,7 @@ export function getDatePartsInTimezone(timestamp: number, timezone: string): Dat
         const weekdayStr = parts.find((p) => p.type === 'weekday')?.value || 'Sun';
         const dayMap: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
 
-        return {
+        const result = {
             year: get('year'),
             month: get('month'),
             day: get('day'),
@@ -97,6 +114,8 @@ export function getDatePartsInTimezone(timestamp: number, timezone: string): Dat
             second: get('second'),
             dayOfWeek: dayMap[weekdayStr] ?? 0,
         };
+        lastPartsByTz.set(timezone, { timestamp, parts: result });
+        return { ...result };
     } catch {
         // Fallback to UTC on error
         const d = new Date(timestamp);
